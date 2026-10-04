@@ -139,6 +139,12 @@ async def _ensure_amc_jwt_once(session: httpx.AsyncClient, *, attempt: int = 1) 
             print("[+] - AMCSecAuthJWT established (profile hop)")
             return True
 
+        # Passwordless / Gmail / already-signed-in: account.microsoft.com often
+        # returns 200 chrome with no Location. Force login.live.com OAuth / wsignin
+        # so AMC cookies get issued (needed for names/manage canary).
+        if await _oauth_amc_signin(session):
+            return True
+
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         detail = format_exception_reason(exc)
         log.warning("ensure_amc_jwt transport error (attempt %s): %s", attempt, detail)
@@ -150,3 +156,109 @@ async def _ensure_amc_jwt_once(session: httpx.AsyncClient, *, attempt: int = 1) 
     if not ok and attempt >= 2:
         print("[!] - No AMCSecAuthJWT — account.microsoft.com APIs will 401")
     return ok
+
+
+_AMC_OAUTH = (
+    "https://login.live.com/oauth20_authorize.srf"
+    "?client_id=000000004C12AE6F"
+    "&response_type=token"
+    "&scope=service::account.microsoft.com::MBI_SSL"
+    "&redirect_uri=https://account.microsoft.com/auth/complete-signin-oauth"
+    "&prompt=none"
+)
+_AMC_WSIGNIN = (
+    "https://login.live.com/login.srf?wa=wsignin1.0"
+    "&wreply=https%3A%2F%2Faccount.microsoft.com%2F"
+    "&rver=7.5.2211.0&wp=MBI_SSL_SHARED"
+)
+_T_RE = re.compile(
+    r'<input[^>]*(?:name|id)="t"[^>]*value="([^"]+)"'
+    r'|<input[^>]*value="([^"]+)"[^>]*(?:name|id)="t"',
+    re.I,
+)
+
+
+async def _chase_interrupt_html(session: httpx.AsyncClient, html: str) -> str:
+    """Accrou / privacy / pprid forms after already-signed-in OAuth."""
+    if not html:
+        return html
+    low = html.lower()
+    if (
+        "pprid" not in html
+        and "privacynotice" not in low
+        and "identity/confirm" not in low
+        and "accrou" not in low
+    ):
+        return html
+    try:
+        from securing.auth.handle_redirects import handle_redirects
+
+        result = await handle_redirects(session, html)
+        if isinstance(result, str) and result not in ("Family", "Recovery"):
+            return result
+    except Exception as exc:
+        log.warning("ensure_amc_jwt interrupt chase failed: %s", exc)
+    return html
+
+
+async def _post_silent_signin(session: httpx.AsyncClient, ticket: str) -> bool:
+    post_urls = (
+        (
+            "https://account.microsoft.com/auth/complete-silent-signin"
+            "?ru=https://account.microsoft.com/"
+            "auth/complete-silent-signin?ru=https%3A%2F%2Faccount.microsoft.com%2F"
+            "&wa=wsignin1.0&refd=login.live.com&wa=wsignin1.0"
+        ),
+        (
+            "https://account.microsoft.com/auth/complete-silent-signin"
+            "?ru=https://account.microsoft.com/"
+            "&wa=wsignin1.0&refd=login.live.com"
+        ),
+        "https://account.microsoft.com/auth/complete-signin-oauth",
+    )
+    for post_url in post_urls:
+        try:
+            await session.post(
+                post_url,
+                data={"t": ticket},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+                follow_redirects=True,
+                timeout=_TIMEOUT,
+            )
+        except (httpx.TimeoutException, httpx.TransportError):
+            continue
+        if has_amc_api_cookies(session):
+            print("[+] - AMCSecAuthJWT established (oauth silent signin)")
+            return True
+    return False
+
+
+async def _oauth_amc_signin(session: httpx.AsyncClient) -> bool:
+    """Force AMC cookies via login.live.com when the AMC homepage is a dead 200."""
+    if has_amc_api_cookies(session):
+        return True
+
+    for url in (_AMC_OAUTH, _AMC_WSIGNIN):
+        try:
+            resp = await session.get(url, follow_redirects=True, timeout=_TIMEOUT)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            log.warning("oauth AMC GET failed (%s): %s", url[:60], exc)
+            continue
+
+        html = await _chase_interrupt_html(session, resp.text or "")
+        if has_amc_api_cookies(session):
+            print("[+] - AMCSecAuthJWT established (oauth redirect)")
+            return True
+
+        t_m = _T_RE.search(html or "")
+        ticket = (t_m.group(1) or t_m.group(2)) if t_m else None
+        if ticket and await _post_silent_signin(session, ticket):
+            return True
+
+        # Hash-fragment tokens sometimes land as a follow-up 302 Location
+        loc = str(getattr(resp, "url", "") or "")
+        if "account.microsoft.com" in loc.lower() and has_amc_api_cookies(session):
+            print("[+] - AMCSecAuthJWT established (oauth landing)")
+            return True
+
+    return has_amc_api_cookies(session)

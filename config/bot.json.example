@@ -13,6 +13,7 @@
       "email": true,
       "goon": false,
       "request_otp": true,
+      "refresh_posts": true,
       "restart": true,
       "secure": true,
       "send_embed": true,
@@ -87,5 +88,9 @@
   "post_verification": {
     "actions": []
   },
-  "ephemeral": false
+  "ephemeral": false,
+  "refresh_posts": {
+    "interval_hours": 30,
+    "posts": []
+  }
 }

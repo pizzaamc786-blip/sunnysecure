@@ -681,18 +681,27 @@ async def _complete_i5600_email_otc(
     # authpwd / post-login polish: no inbox we can read — try resolve masked
     # proof from our security_emails DB (prior secure left 22*****@domain on the
     # account while account_info still says Couldn't Change!).
+    # Only poll OTP on inboxes we control. Gmail / login-as-proof accounts
+    # hang get_email_code for ~2 min and never receive mail.
+    our_domain = _config_domain()
+    sec_l = (security_email or "").strip().lower()
     can_read_otp = bool(
-        security_email
-        and security_email != "Couldn't Change!"
-        and "@" in security_email
-        and (not login or security_email.strip().lower() != login.strip().lower())
+        sec_l
+        and "@" in sec_l
+        and sec_l not in ("couldn't change!", "unknown", "n/a", "?")
+        and our_domain
+        and sec_l.endswith(f"@{our_domain}")
     )
     if not can_read_otp:
         resolved = _resolve_security_email_from_masked_display(proof.get("display") or "")
         if resolved:
             security_email = resolved
-            can_read_otp = True
-            print(f"[~] - {label}: resolved OTP inbox from masked proof → {resolved}")
+            res_l = resolved.strip().lower()
+            can_read_otp = bool(
+                our_domain and res_l.endswith(f"@{our_domain}")
+            )
+            if can_read_otp:
+                print(f"[~] - {label}: resolved OTP inbox from masked proof → {resolved}")
     if not can_read_otp:
         late = await _password_attempt()
         if late is not None:
